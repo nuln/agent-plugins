@@ -1,0 +1,588 @@
+package claudecode
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/nuln/agent-core"
+)
+
+// claudeSession manages a long-running Claude Code process using
+// --input-format stream-json and --permission-prompt-tool stdio.
+//
+// In "auto" mode, permission requests are auto-approved internally
+// (avoiding --dangerously-skip-permissions which fails under root).
+type claudeSession struct {
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	stdinMu     sync.Mutex
+	events      chan agent.Event
+	sessionID   atomic.Value // stores string
+	autoApprove bool         // auto mode: approve all permission requests
+	workDir     string
+	ctx         context.Context
+	cancel      context.CancelFunc
+	done        chan struct{}
+	alive       atomic.Bool
+}
+
+func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode string, allowedTools []string, extraEnv []string) (*claudeSession, error) {
+	sessionCtx, cancel := context.WithCancel(ctx)
+
+	args := []string{
+		"--output-format", "stream-json",
+		"--verbose",
+		"--input-format", "stream-json",
+		"--permission-prompt-tool", "stdio",
+	}
+
+	if mode != "" && mode != "default" {
+		args = append(args, "--permission-mode", mode)
+	}
+	if sessionID != "" {
+		args = append(args, "--resume", sessionID)
+	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	if len(allowedTools) > 0 {
+		args = append(args, "--allowedTools", strings.Join(allowedTools, ","))
+	}
+
+	if sysPrompt := agent.AgentSystemPrompt(); sysPrompt != "" {
+		args = append(args, "--append-system-prompt", sysPrompt)
+	}
+
+	slog.Debug("claudecodeSession: launching", "args", redactArgs(args), "dir", workDir, "mode", mode)
+
+	cmd := exec.CommandContext(sessionCtx, "claude", args...)
+	cmd.Dir = workDir
+	// Filter out CLAUDECODE env var to prevent "nested session" detection,
+	// since cc-connect is a bridge, not a nested Claude Code session.
+	env := filterEnv(os.Environ(), "CLAUDECODE")
+	if len(extraEnv) > 0 {
+		env = mergeEnv(env, extraEnv)
+	}
+	cmd.Env = env
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("claudeSession: stdin pipe: %w", err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("claudeSession: stdout pipe: %w", err)
+	}
+
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("claudeSession: start: %w", err)
+	}
+
+	cs := &claudeSession{
+		cmd:         cmd,
+		stdin:       stdin,
+		events:      make(chan agent.Event, 64),
+		autoApprove: mode == "bypassPermissions",
+		workDir:     workDir,
+		ctx:         sessionCtx,
+		cancel:      cancel,
+		done:        make(chan struct{}),
+	}
+	cs.sessionID.Store(sessionID)
+	cs.alive.Store(true)
+
+	go cs.readLoop(stdout, &stderrBuf)
+
+	return cs, nil
+}
+
+func (cs *claudeSession) readLoop(stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
+	defer func() {
+		cs.alive.Store(false)
+		if err := cs.cmd.Wait(); err != nil {
+			stderrMsg := strings.TrimSpace(stderrBuf.String())
+			if stderrMsg != "" {
+				slog.Error("claudeSession: process failed", "error", err, "stderr", stderrMsg)
+				evt := agent.Event{Type: agent.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+				select {
+				case cs.events <- evt:
+				case <-cs.ctx.Done():
+					return
+				}
+			}
+		}
+		close(cs.events)
+		close(cs.done)
+	}()
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+			slog.Debug("claudeSession: non-JSON line", "line", line)
+			continue
+		}
+
+		eventType, _ := raw["type"].(string)
+		slog.Debug("claudeSession: event", "type", eventType)
+
+		switch eventType {
+		case "system":
+			cs.handleSystem(raw)
+		case "assistant":
+			cs.handleAssistant(raw)
+		case "user":
+			cs.handleUser(raw)
+		case "result":
+			cs.handleResult(raw)
+		case "control_request":
+			cs.handleControlRequest(raw)
+		case "control_cancel_request":
+			requestID, _ := raw["request_id"].(string)
+			slog.Debug("claudeSession: permission cancelled", "request_id", requestID)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		slog.Error("claudeSession: scanner error", "error", err)
+		evt := agent.Event{Type: agent.EventError, Error: fmt.Errorf("read stdout: %w", err)}
+		select {
+		case cs.events <- evt:
+		case <-cs.ctx.Done():
+			return
+		}
+	}
+}
+
+func (cs *claudeSession) handleSystem(raw map[string]any) {
+	if sid, ok := raw["session_id"].(string); ok && sid != "" {
+		cs.sessionID.Store(sid)
+		evt := agent.Event{Type: agent.EventText, SessionID: sid}
+		select {
+		case cs.events <- evt:
+		case <-cs.ctx.Done():
+			return
+		}
+	}
+}
+
+func (cs *claudeSession) handleAssistant(raw map[string]any) {
+	msg, ok := raw["message"].(map[string]any)
+	if !ok {
+		return
+	}
+	contentArr, ok := msg["content"].([]any)
+	if !ok {
+		return
+	}
+	for _, contentItem := range contentArr {
+		item, ok := contentItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		contentType, _ := item["type"].(string)
+		switch contentType {
+		case "tool_use":
+			toolName, _ := item["name"].(string)
+			if toolName == "AskUserQuestion" {
+				continue
+			}
+			inputSummary := summarizeInput(toolName, item["input"])
+			evt := agent.Event{Type: agent.EventToolUse, ToolName: toolName, ToolInput: inputSummary}
+			select {
+			case cs.events <- evt:
+			case <-cs.ctx.Done():
+				return
+			}
+		case "thinking":
+			if thinking, ok := item["thinking"].(string); ok && thinking != "" {
+				evt := agent.Event{Type: agent.EventThinking, Content: thinking}
+				select {
+				case cs.events <- evt:
+				case <-cs.ctx.Done():
+					return
+				}
+			}
+		case "text":
+			if text, ok := item["text"].(string); ok && text != "" {
+				evt := agent.Event{Type: agent.EventText, Content: text}
+				select {
+				case cs.events <- evt:
+				case <-cs.ctx.Done():
+					return
+				}
+			}
+		}
+	}
+}
+
+func (cs *claudeSession) handleUser(raw map[string]any) {
+	msg, ok := raw["message"].(map[string]any)
+	if !ok {
+		return
+	}
+	contentArr, ok := msg["content"].([]any)
+	if !ok {
+		return
+	}
+	for _, contentItem := range contentArr {
+		item, ok := contentItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		contentType, _ := item["type"].(string)
+		if contentType == "tool_result" {
+			isError, _ := item["is_error"].(bool)
+			if isError {
+				result, _ := item["content"].(string)
+				slog.Debug("claudeSession: tool error", "content", result)
+			}
+		}
+	}
+}
+
+func (cs *claudeSession) handleResult(raw map[string]any) {
+	var content string
+	if result, ok := raw["result"].(string); ok {
+		content = result
+	}
+	if sid, ok := raw["session_id"].(string); ok && sid != "" {
+		cs.sessionID.Store(sid)
+	}
+	evt := agent.Event{Type: agent.EventResult, Content: content, SessionID: cs.CurrentSessionID(), Done: true}
+	select {
+	case cs.events <- evt:
+	case <-cs.ctx.Done():
+		return
+	}
+}
+
+func (cs *claudeSession) handleControlRequest(raw map[string]any) {
+	requestID, _ := raw["request_id"].(string)
+	request, _ := raw["request"].(map[string]any)
+	if request == nil {
+		return
+	}
+	subtype, _ := request["subtype"].(string)
+	if subtype != "can_use_tool" {
+		slog.Debug("claudeSession: unknown control request subtype", "subtype", subtype)
+		return
+	}
+
+	toolName, _ := request["tool_name"].(string)
+	input, _ := request["input"].(map[string]any)
+
+	// Auto mode: approve immediately without asking the user
+	if cs.autoApprove {
+		slog.Debug("claudeSession: auto-approving", "request_id", requestID, "tool", toolName)
+		_ = cs.RespondPermission(requestID, agent.PermissionResult{
+			Behavior:     "allow",
+			UpdatedInput: input,
+		})
+		return
+	}
+
+	slog.Info("claudeSession: permission request", "request_id", requestID, "tool", toolName)
+	evt := agent.Event{
+		Type:         agent.EventPermissionRequest,
+		RequestID:    requestID,
+		ToolName:     toolName,
+		ToolInput:    summarizeInput(toolName, input),
+		ToolInputRaw: input,
+	}
+
+	if toolName == "AskUserQuestion" {
+		evt.Questions = parseUserQuestions(input)
+	}
+
+	select {
+	case cs.events <- evt:
+	case <-cs.ctx.Done():
+		return
+	}
+}
+
+// Send writes a user message (with optional images and files) to the Claude process stdin.
+// Images are sent as base64 in the multimodal content array.
+// Files are saved to local temp files and referenced in the text prompt
+// so Claude Code can read them with its built-in tools.
+func (cs *claudeSession) Send(prompt string, images []agent.ImageAttachment, files []agent.FileAttachment) error {
+	if !cs.alive.Load() {
+		return fmt.Errorf("session process is not running")
+	}
+
+	if len(images) == 0 && len(files) == 0 {
+		return cs.writeJSON(map[string]any{
+			"type":    "user",
+			"message": map[string]any{"role": "user", "content": prompt},
+		})
+	}
+
+	attachDir := filepath.Join(cs.workDir, ".cc-connect", "attachments")
+	_ = os.MkdirAll(attachDir, 0o755)
+
+	parts := make([]map[string]any, 0, len(images)+1)
+	savedPaths := make([]string, 0, len(images))
+
+	// Save and encode images
+	for i, img := range images {
+		ext := extFromMime(img.MimeType)
+		fname := fmt.Sprintf("img_%d_%d%s", time.Now().UnixMilli(), i, ext)
+		fpath := filepath.Join(attachDir, fname)
+		if err := os.WriteFile(fpath, img.Data, 0o644); err != nil {
+			slog.Error("claudeSession: save image failed", "error", err)
+			continue
+		}
+		savedPaths = append(savedPaths, fpath)
+		slog.Debug("claudeSession: image saved", "path", fpath, "size", len(img.Data))
+
+		mimeType := img.MimeType
+		if mimeType == "" {
+			mimeType = "image/png"
+		}
+		parts = append(parts, map[string]any{
+			"type": "image",
+			"source": map[string]any{
+				"type":       "base64",
+				"media_type": mimeType,
+				"data":       base64.StdEncoding.EncodeToString(img.Data),
+			},
+		})
+	}
+
+	// Save files to disk so Claude Code can read them
+	filePaths := saveFilesToDisk(cs.workDir, files)
+
+	// Build text part: user prompt + file path references
+	textPart := prompt
+	if textPart == "" && len(filePaths) > 0 {
+		textPart = "Please analyze the attached file(s)."
+	} else if textPart == "" {
+		textPart = "Please analyze the attached image(s)."
+	}
+	if len(savedPaths) > 0 {
+		textPart += "\n\n(Images also saved locally: " + strings.Join(savedPaths, ", ") + ")"
+	}
+	if len(filePaths) > 0 {
+		textPart += "\n\n(Files saved locally, please read them: " + strings.Join(filePaths, ", ") + ")"
+	}
+	parts = append(parts, map[string]any{"type": "text", "text": textPart})
+
+	return cs.writeJSON(map[string]any{
+		"type":    "user",
+		"message": map[string]any{"role": "user", "content": parts},
+	})
+}
+
+func extFromMime(mime string) string {
+	switch mime {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	default:
+		return ".png"
+	}
+}
+
+// RespondPermission writes a control_response to the Claude process stdin.
+func (cs *claudeSession) RespondPermission(requestID string, result agent.PermissionResult) error {
+	if !cs.alive.Load() {
+		return fmt.Errorf("session process is not running")
+	}
+
+	var permResponse map[string]any
+	if result.Behavior == "allow" {
+		updatedInput := result.UpdatedInput
+		if updatedInput == nil {
+			updatedInput = make(map[string]any)
+		}
+		permResponse = map[string]any{
+			"behavior":     "allow",
+			"updatedInput": updatedInput,
+		}
+	} else {
+		msg := result.Message
+		if msg == "" {
+			msg = "The user denied this tool use. Stop and wait for the user's instructions."
+		}
+		permResponse = map[string]any{
+			"behavior": "deny",
+			"message":  msg,
+		}
+	}
+
+	controlResponse := map[string]any{
+		"type": "control_response",
+		"response": map[string]any{
+			"subtype":    "success",
+			"request_id": requestID,
+			"response":   permResponse,
+		},
+	}
+
+	slog.Debug("claudeSession: permission response", "request_id", requestID, "behavior", result.Behavior)
+	return cs.writeJSON(controlResponse)
+}
+
+func (cs *claudeSession) writeJSON(v any) error {
+	cs.stdinMu.Lock()
+	defer cs.stdinMu.Unlock()
+
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	if _, err := cs.stdin.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("write stdin: %w", err)
+	}
+	return nil
+}
+
+func (cs *claudeSession) Events() <-chan agent.Event {
+	return cs.events
+}
+
+func (cs *claudeSession) CurrentSessionID() string {
+	v, _ := cs.sessionID.Load().(string)
+	return v
+}
+
+func (cs *claudeSession) Alive() bool {
+	return cs.alive.Load()
+}
+
+func (cs *claudeSession) Close() error {
+	cs.cancel()
+
+	select {
+	case <-cs.done:
+		return nil
+	case <-time.After(8 * time.Second):
+		slog.Warn("claudeSession: graceful close timed out, killing process")
+		if cs.cmd != nil && cs.cmd.Process != nil {
+			_ = cs.cmd.Process.Kill()
+		}
+		<-cs.done
+		return nil
+	}
+}
+
+// filterEnv returns a copy of env with entries matching the given key removed.
+func filterEnv(env []string, key string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// redactArgs returns a copy of args with values after sensitive flag names masked.
+func redactArgs(args []string) []string {
+	out := make([]string, len(args))
+	copy(out, args)
+
+	sensitiveFlags := []string{
+		"--api-key", "--api_key", "--apikey",
+		"--token", "--secret", "--password",
+		"-k",
+	}
+
+	for i := 0; i < len(out); i++ {
+		arg := strings.ToLower(out[i])
+
+		// --flag=value format
+		for _, f := range sensitiveFlags {
+			if strings.HasPrefix(arg, f+"=") {
+				out[i] = out[i][:strings.Index(out[i], "=")+1] + "***"
+				break
+			}
+		}
+
+		// --flag value format
+		for _, f := range sensitiveFlags {
+			if arg == f && i+1 < len(out) {
+				out[i+1] = "***"
+				i++
+				break
+			}
+		}
+	}
+	return out
+}
+
+// mergeEnv merges two environment variable slices.
+func mergeEnv(base, extra []string) []string {
+	m := make(map[string]string)
+	for _, e := range base {
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) == 2 {
+			m[parts[0]] = parts[1]
+		}
+	}
+	for _, e := range extra {
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) == 2 {
+			m[parts[0]] = parts[1]
+		}
+	}
+	res := make([]string, 0, len(m))
+	for k, v := range m {
+		res = append(res, k+"="+v)
+	}
+	return res
+}
+
+// saveFilesToDisk saves a list of file attachments to a temporary directory.
+func saveFilesToDisk(workDir string, files []agent.FileAttachment) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	attachDir := filepath.Join(workDir, ".cc-connect", "attachments")
+	_ = os.MkdirAll(attachDir, 0o755)
+
+	var paths []string
+	for _, f := range files {
+		fname := f.FileName
+		if fname == "" {
+			fname = fmt.Sprintf("file_%d", time.Now().UnixNano())
+		}
+		path := filepath.Join(attachDir, fname)
+		if err := os.WriteFile(path, f.Data, 0o644); err == nil {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
