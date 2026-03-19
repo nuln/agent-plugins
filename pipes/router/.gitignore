@@ -2,3 +2,6 @@
 /data/
 *.exe
 *.test
+
+go.work
+go.work.sum

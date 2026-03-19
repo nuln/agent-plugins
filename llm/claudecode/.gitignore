@@ -16,3 +16,6 @@ vendor/
 
 # OS specific
 .DS_Store
+
+go.work
+go.work.sum

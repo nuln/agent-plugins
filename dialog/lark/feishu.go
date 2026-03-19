@@ -26,6 +26,12 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 )
 
+func init() {
+	agent.RegisterDialog("lark", func(opts map[string]any) (agent.Dialog, error) {
+		return New(opts)
+	})
+}
+
 type replyContext struct {
 	messageID string
 	chatID    string
