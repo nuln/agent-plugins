@@ -1,0 +1,22 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - gofmt
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment
+      - shadow

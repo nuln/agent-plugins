@@ -21,6 +21,22 @@ import (
 )
 
 func init() {
+	agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+		PluginName:  "claudecode",
+		PluginType:  "llm",
+		Description: "Anthropic Claude Code CLI integration",
+		Fields: []agent.ConfigField{
+			{EnvVar: "ANTHROPIC_API_KEY", Key: "api_key", Description: "Anthropic API key", Type: agent.ConfigFieldSecret},
+			{EnvVar: "ANTHROPIC_BASE_URL", Key: "base_url", Description: "Anthropic API base URL", Default: "https://api.anthropic.com", Type: agent.ConfigFieldString},
+			{EnvVar: "CLAUDE_CONFIG_DIR", Key: "config_dir", Description: "Custom config directory for Claude (overrides ~/.claude)", Type: agent.ConfigFieldString},
+			{Key: "work_dir", Description: "Working directory for Claude Code", Default: ".", Type: agent.ConfigFieldString},
+			{Key: "model", Description: "Model name (e.g. sonnet, opus, haiku)", Type: agent.ConfigFieldString, Example: "sonnet"},
+			{Key: "mode", Description: "Permission mode", Type: agent.ConfigFieldEnum, AllowedValues: []string{"default", "acceptEdits", "plan", "bypassPermissions"}},
+			{Key: "router_url", Description: "Claude Code Router URL", Type: agent.ConfigFieldString},
+			{Key: "router_api_key", Description: "Claude Code Router API key", Type: agent.ConfigFieldSecret},
+		},
+	})
+
 	agent.RegisterLLM("claudecode", New)
 }
 
@@ -36,6 +52,7 @@ type LLM struct {
 	workDir      string
 	model        string
 	mode         string // "default" | "acceptEdits" | "plan" | "bypassPermissions"
+	configDir    string // CLAUDE_CONFIG_DIR override (empty = use default ~/.claude)
 	allowedTools []string
 	providers    []agent.ProviderConfig
 	activeIdx    int // -1 = no provider set
@@ -71,6 +88,11 @@ func New(opts map[string]any) (agent.LLM, error) {
 	routerURL, _ := opts["router_url"].(string)
 	routerAPIKey, _ := opts["router_api_key"].(string)
 
+	configDir, _ := opts["config_dir"].(string)
+	if configDir == "" {
+		configDir = os.Getenv("CLAUDE_CONFIG_DIR")
+	}
+
 	if _, err := exec.LookPath("claude"); err != nil {
 		return nil, fmt.Errorf("claudecode: 'claude' CLI not found in PATH, please install Claude Code first")
 	}
@@ -79,6 +101,7 @@ func New(opts map[string]any) (agent.LLM, error) {
 		workDir:      workDir,
 		model:        model,
 		mode:         mode,
+		configDir:    configDir,
 		allowedTools: allowedTools,
 		activeIdx:    -1,
 		routerURL:    routerURL,
@@ -206,6 +229,11 @@ func (a *LLM) StartSession(ctx context.Context, sessionID string) (agent.AgentSe
 	model := a.model
 	extraEnv := a.providerEnvLocked()
 	extraEnv = append(extraEnv, a.sessionEnv...)
+
+	// Inject config dir (plugin-level, overrideable by provider Env)
+	if a.configDir != "" {
+		extraEnv = append(extraEnv, "CLAUDE_CONFIG_DIR="+a.configDir)
+	}
 
 	// Add Claude Code Router environment variables if configured
 	if a.routerURL != "" {

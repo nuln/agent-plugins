@@ -9,6 +9,12 @@ import (
 )
 
 func init() {
+	agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+		PluginName:  "router",
+		PluginType:  "pipe",
+		Description: "Routes messages to different LLM agents via slash commands",
+	})
+
 	agent.RegisterPipe("router", 900, func(ctx agent.PipeContext) agent.Pipe {
 		return &RouterHook{
 			sessions:   ctx.Sessions,

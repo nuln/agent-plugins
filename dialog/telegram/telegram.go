@@ -31,6 +31,21 @@ var (
 )
 
 func init() {
+	agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+		PluginName:  "telegram",
+		PluginType:  "dialog",
+		Description: "Telegram Bot messaging platform integration",
+		Fields: []agent.ConfigField{
+			{EnvVar: "TELEGRAM_TOKEN", Key: "token", Description: "Telegram Bot API token", Required: true, Type: agent.ConfigFieldSecret},
+			{EnvVar: "TELEGRAM_ALLOW_USER_IDS", Key: "allow_from", Description: "Comma-separated list of allowed Telegram user IDs", Type: agent.ConfigFieldString},
+			{Key: "proxy", Description: "HTTP proxy URL for Telegram API access", Type: agent.ConfigFieldString},
+			{Key: "proxy_username", Description: "Proxy authentication username", Type: agent.ConfigFieldString},
+			{Key: "proxy_password", Description: "Proxy authentication password", Type: agent.ConfigFieldSecret},
+			{Key: "group_reply_all", Description: "Reply to all messages in group chats", Default: "false", Type: agent.ConfigFieldBool},
+			{Key: "share_session_in_channel", Description: "Share session across group channel", Default: "false", Type: agent.ConfigFieldBool},
+		},
+	})
+
 	agent.RegisterDialog("telegram", func(opts map[string]any) (agent.Dialog, error) {
 		return New(opts)
 	})

@@ -17,6 +17,21 @@ import (
 )
 
 func init() {
+	agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+		PluginName:  "codex",
+		PluginType:  "llm",
+		Description: "OpenAI Codex CLI integration",
+		Fields: []agent.ConfigField{
+			{EnvVar: "OPENAI_API_KEY", Key: "api_key", Description: "OpenAI API key", Type: agent.ConfigFieldSecret},
+			{EnvVar: "OPENAI_BASE_URL", Key: "base_url", Description: "OpenAI API base URL", Type: agent.ConfigFieldString},
+			{EnvVar: "CODEX_HOME", Key: "codex_home", Description: "Codex home directory for configuration", Type: agent.ConfigFieldString},
+			{Key: "work_dir", Description: "Working directory for Codex", Default: ".", Type: agent.ConfigFieldString},
+			{Key: "model", Description: "Model name", Type: agent.ConfigFieldString},
+			{Key: "reasoning_effort", Description: "Reasoning effort level", Type: agent.ConfigFieldEnum, AllowedValues: []string{"low", "medium", "high", "xhigh"}},
+			{Key: "mode", Description: "Execution mode", Type: agent.ConfigFieldEnum, AllowedValues: []string{"suggest", "auto-edit", "full-auto", "yolo"}},
+		},
+	})
+
 	agent.RegisterLLM("codex", New)
 }
 

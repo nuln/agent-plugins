@@ -2,15 +2,34 @@ package guardrail
 
 import (
 	"context"
+	"os"
 	"strings"
 
 	"github.com/nuln/agent-core"
 )
 
 func init() {
+	agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+		PluginName:  "guardrail",
+		PluginType:  "pipe",
+		Description: "Safety checks and permission enforcement",
+		Fields: []agent.ConfigField{
+			{EnvVar: "GUARDRAIL_ADMINS", Key: "admins", Description: "Comma-separated list of admin user IDs", Default: "admin", Type: agent.ConfigFieldString, Example: "admin,user123"},
+		},
+	})
+
 	agent.RegisterPipe("guardrail", 700, func(ctx agent.PipeContext) agent.Pipe {
-		// Admin list could be loaded from config here
-		return NewGuardrail([]string{"admin"}, ctx.Sessions, ctx.Translator)
+		admins := []string{"admin"}
+		if v := os.Getenv("GUARDRAIL_ADMINS"); v != "" {
+			parts := strings.Split(v, ",")
+			admins = admins[:0]
+			for _, p := range parts {
+				if s := strings.TrimSpace(p); s != "" {
+					admins = append(admins, s)
+				}
+			}
+		}
+		return NewGuardrail(admins, ctx.Sessions, ctx.Translator)
 	})
 }
 

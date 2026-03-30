@@ -9,6 +9,12 @@ import (
 )
 
 func init() {
+	agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+		PluginName:  "contextinjector",
+		PluginType:  "pipe",
+		Description: "Prepends current timestamp/context to each message",
+	})
+
 	agent.RegisterPipe("contextinjector", 600, func(_ agent.PipeContext) agent.Pipe {
 		return NewContextInjector()
 	})

@@ -9,6 +9,12 @@ import (
 )
 
 func init() {
+	agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+		PluginName:  "telemetry",
+		PluginType:  "pipe",
+		Description: "Logs message metadata for audit and metrics",
+	})
+
 	agent.RegisterPipe("telemetry", 100, func(_ agent.PipeContext) agent.Pipe {
 		return NewTelemetry()
 	})

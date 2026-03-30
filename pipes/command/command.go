@@ -3,6 +3,7 @@ package command
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -11,9 +12,27 @@ import (
 )
 
 func init() {
+	agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+		PluginName:  "command",
+		PluginType:  "pipe",
+		Description: "Slash command processor with safety guardrail",
+		Fields: []agent.ConfigField{
+			{EnvVar: "GUARDRAIL_ADMINS", Key: "admins", Description: "Comma-separated admin user IDs (shared with guardrail pipe)", Default: "admin", Type: agent.ConfigFieldString},
+		},
+	})
+
 	agent.RegisterPipe("command", 1000, func(ctx agent.PipeContext) agent.Pipe {
-		// Guardrail is now in command package too
-		safety := NewGuardrail([]string{"admin"}, ctx.Sessions, ctx.Translator)
+		admins := []string{"admin"}
+		if v := os.Getenv("GUARDRAIL_ADMINS"); v != "" {
+			parts := strings.Split(v, ",")
+			admins = admins[:0]
+			for _, p := range parts {
+				if s := strings.TrimSpace(p); s != "" {
+					admins = append(admins, s)
+				}
+			}
+		}
+		safety := NewGuardrail(admins, ctx.Sessions, ctx.Translator)
 		return NewCommandRegistry(safety)
 	})
 }

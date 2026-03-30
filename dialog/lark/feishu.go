@@ -27,6 +27,22 @@ import (
 )
 
 func init() {
+	agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+		PluginName:  "lark",
+		PluginType:  "dialog",
+		Description: "Lark/Feishu messaging platform integration",
+		Fields: []agent.ConfigField{
+			{EnvVar: "LARK_APP_ID", Key: "app_id", Description: "Lark application ID", Required: true, Type: agent.ConfigFieldString},
+			{EnvVar: "LARK_APP_SECRET", Key: "app_secret", Description: "Lark application secret", Required: true, Type: agent.ConfigFieldSecret},
+			{Key: "reaction_emoji", Description: "Emoji reaction on incoming messages", Default: "OnIt", Type: agent.ConfigFieldString},
+			{Key: "allow_from", Description: "Comma-separated list of allowed user/chat IDs", Type: agent.ConfigFieldString},
+			{Key: "group_reply_all", Description: "Reply to all messages in group chats", Default: "false", Type: agent.ConfigFieldBool},
+			{Key: "share_session_in_channel", Description: "Share session across group channel", Default: "false", Type: agent.ConfigFieldBool},
+			{Key: "reply_in_thread", Description: "Reply in message thread", Default: "false", Type: agent.ConfigFieldBool},
+			{Key: "enable_feishu_card", Description: "Use interactive card responses", Default: "true", Type: agent.ConfigFieldBool},
+		},
+	})
+
 	agent.RegisterDialog("lark", func(opts map[string]any) (agent.Dialog, error) {
 		return New(opts)
 	})

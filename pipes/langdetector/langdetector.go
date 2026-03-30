@@ -7,6 +7,12 @@ import (
 )
 
 func init() {
+	agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+		PluginName:  "langdetector",
+		PluginType:  "pipe",
+		Description: "Detects user language and annotates the message",
+	})
+
 	agent.RegisterPipe("langdetector", 400, func(_ agent.PipeContext) agent.Pipe {
 		return NewLangDetector()
 	})
