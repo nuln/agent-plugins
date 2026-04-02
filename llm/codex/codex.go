@@ -47,6 +47,9 @@ type LLM struct {
 	model           string
 	reasoningEffort string
 	mode            string // "suggest" | "auto-edit" | "full-auto" | "yolo"
+	apiKey          string // OPENAI_API_KEY injected into session env
+	baseURL         string // OPENAI_BASE_URL injected into session env
+	codexHome       string // CODEX_HOME injected into session env
 	providers       []agent.ProviderConfig
 	activeIdx       int // -1 = no provider set
 	sessionEnv      []string
@@ -63,6 +66,19 @@ func New(opts map[string]any) (agent.LLM, error) {
 	mode, _ := opts["mode"].(string)
 	mode = normalizeMode(mode)
 
+	apiKey, _ := opts["api_key"].(string)
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+	baseURL, _ := opts["base_url"].(string)
+	if baseURL == "" {
+		baseURL = os.Getenv("OPENAI_BASE_URL")
+	}
+	codexHome, _ := opts["codex_home"].(string)
+	if codexHome == "" {
+		codexHome = os.Getenv("CODEX_HOME")
+	}
+
 	if _, err := exec.LookPath("codex"); err != nil {
 		return nil, fmt.Errorf("codex: 'codex' CLI not found in PATH, install with: npm install -g @openai/codex")
 	}
@@ -72,6 +88,9 @@ func New(opts map[string]any) (agent.LLM, error) {
 		model:           model,
 		reasoningEffort: normalizeReasoningEffort(reasoningEffort),
 		mode:            mode,
+		apiKey:          apiKey,
+		baseURL:         baseURL,
+		codexHome:       codexHome,
 		activeIdx:       -1,
 	}, nil
 }
@@ -293,7 +312,19 @@ func (a *LLM) StartSession(ctx context.Context, sessionID string) (agent.AgentSe
 	mode := a.mode
 	model := a.model
 	reasoningEffort := a.reasoningEffort
-	extraEnv := a.providerEnvLocked()
+	workDir := a.workDir
+	// Plugin-level credentials injected first; provider overrides them if set.
+	var pluginEnv []string
+	if a.apiKey != "" {
+		pluginEnv = append(pluginEnv, "OPENAI_API_KEY="+a.apiKey)
+	}
+	if a.baseURL != "" {
+		pluginEnv = append(pluginEnv, "OPENAI_BASE_URL="+a.baseURL)
+	}
+	if a.codexHome != "" {
+		pluginEnv = append(pluginEnv, "CODEX_HOME="+a.codexHome)
+	}
+	extraEnv := append(pluginEnv, a.providerEnvLocked()...)
 	extraEnv = append(extraEnv, a.sessionEnv...)
 	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
 		if m := a.providers[a.activeIdx].Model; m != "" {
@@ -302,7 +333,7 @@ func (a *LLM) StartSession(ctx context.Context, sessionID string) (agent.AgentSe
 	}
 	a.mu.Unlock()
 
-	return newCodexSession(ctx, a.workDir, model, reasoningEffort, mode, sessionID, extraEnv), nil
+	return newCodexSession(ctx, workDir, model, reasoningEffort, mode, sessionID, extraEnv), nil
 }
 
 func (a *LLM) ListSessions(_ context.Context) ([]agent.AgentSessionInfo, error) {
@@ -327,14 +358,89 @@ func (a *LLM) Reload(opts map[string]any) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if opts != nil {
-		_, _ = opts["api_key"].(string)
+	readOpt := func(key, fallback string) string {
+		if opts != nil {
+			if v, _ := opts[key].(string); v != "" {
+				return v
+			}
+		}
+		return fallback
 	}
-	_ = os.Getenv("OPENAI_API_KEY")
 
-	// Codex doesn't store apiKey directly but uses it for API calls.
-	// Reloading here could mean refreshing cached models or similar.
-	slog.Info("codex: reloaded config")
+	workDir := readOpt("work_dir", a.workDir)
+	if workDir == "" {
+		workDir = "."
+	}
+	model := readOpt("model", a.model)
+	reasoningEffort := normalizeReasoningEffort(readOpt("reasoning_effort", a.reasoningEffort))
+	mode := readOpt("mode", "")
+	if mode != "" {
+		mode = normalizeMode(mode)
+	} else {
+		mode = a.mode
+	}
+	apiKey := readOpt("api_key", "")
+	if apiKey == "" {
+		if env := os.Getenv("OPENAI_API_KEY"); env != "" {
+			apiKey = env
+		} else {
+			apiKey = a.apiKey
+		}
+	}
+	baseURL := readOpt("base_url", "")
+	if baseURL == "" {
+		if env := os.Getenv("OPENAI_BASE_URL"); env != "" {
+			baseURL = env
+		} else {
+			baseURL = a.baseURL
+		}
+	}
+	codexHome := readOpt("codex_home", "")
+	if codexHome == "" {
+		if env := os.Getenv("CODEX_HOME"); env != "" {
+			codexHome = env
+		} else {
+			codexHome = a.codexHome
+		}
+	}
+
+	changed := false
+	if workDir != a.workDir {
+		a.workDir = workDir
+		changed = true
+	}
+	if model != a.model {
+		a.model = model
+		changed = true
+	}
+	if reasoningEffort != a.reasoningEffort {
+		a.reasoningEffort = reasoningEffort
+		changed = true
+	}
+	if mode != a.mode {
+		a.mode = mode
+		changed = true
+	}
+	if apiKey != a.apiKey {
+		a.apiKey = apiKey
+		changed = true
+	}
+	if baseURL != a.baseURL {
+		a.baseURL = baseURL
+		changed = true
+	}
+	if codexHome != a.codexHome {
+		a.codexHome = codexHome
+		changed = true
+	}
+
+	if changed {
+		slog.Info("codex: reloaded config",
+			"work_dir", a.workDir, "model", a.model, "mode", a.mode,
+			"api_key_configured", a.apiKey != "",
+			"base_url_configured", a.baseURL != "",
+			"codex_home", a.codexHome)
+	}
 	return nil
 }
 
@@ -363,7 +469,10 @@ func (a *LLM) SkillDirs() []string {
 		filepath.Join(absDir, ".codex", "skills"),
 		filepath.Join(absDir, ".claude", "skills"),
 	}
-	codexHome := os.Getenv("CODEX_HOME")
+	codexHome := a.codexHome
+	if codexHome == "" {
+		codexHome = os.Getenv("CODEX_HOME")
+	}
 	if codexHome == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			codexHome = filepath.Join(home, ".codex")
@@ -397,7 +506,10 @@ func (a *LLM) GlobalMemoryFile() string {
 	if err != nil {
 		return ""
 	}
-	codexHome := os.Getenv("CODEX_HOME")
+	codexHome := a.codexHome
+	if codexHome == "" {
+		codexHome = os.Getenv("CODEX_HOME")
+	}
 	if codexHome == "" {
 		codexHome = filepath.Join(homeDir, ".codex")
 	}

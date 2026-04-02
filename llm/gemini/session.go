@@ -106,7 +106,9 @@ func (gs *geminiSession) Send(prompt string, images []agent.ImageAttachment, fil
 	}
 
 	chatID := gs.CurrentSessionID()
-	isResume := chatID != ""
+	// 核心修复：只有当 ID 确实来自于 Gemini CLI（UUID 或数字）时才进行恢复。
+	// 框架生成的临时 ID (s177...) 应被视为新对话，不传 --resume 参数。
+	isResume := chatID != "" && !strings.HasPrefix(chatID, "s")
 
 	args := []string{
 		"--output-format", "stream-json",
@@ -296,12 +298,23 @@ func (gs *geminiSession) handleInit(raw map[string]any) {
 func (gs *geminiSession) handleMessage(raw map[string]any) {
 	role, _ := raw["role"].(string)
 	content, _ := raw["content"].(string)
+	delta, _ := raw["delta"].(bool)
 
 	if role == "user" || content == "" {
 		return
 	}
 
-	gs.pendingMsgs = append(gs.pendingMsgs, content)
+	if delta {
+		// 流式输出：直接发出事件，不进入 pending 缓存
+		evt := agent.Event{Type: agent.EventText, Content: content}
+		select {
+		case gs.events <- evt:
+		case <-gs.ctx.Done():
+		}
+	} else {
+		// 非流式（完整消息）：存入缓存供后续统一处理（如果是历史消息）
+		gs.pendingMsgs = append(gs.pendingMsgs, content)
+	}
 }
 
 func (gs *geminiSession) handleToolUse(raw map[string]any) {

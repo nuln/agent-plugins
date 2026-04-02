@@ -37,36 +37,46 @@ func init() {
 //   - "default":   ask permission for each tool call
 //   - "autopilot": auto-approve continuation (--autopilot)
 //   - "yolo":      auto-approve everything (--yolo)
+//
+// Environment variable overrides:
+//   - COPILOT_GITHUB_TOKEN: Personal access token for GitHub authentication
+//   - COPILOT_HOME: Custom config directory location (~/.copilot by default)
+//   - COPILOT_PROVIDER_BASE_URL: Custom LLM provider endpoint (for enterprise)
 type LLM struct {
-	workDir    string
-	model      string
-	mode       string // "default" | "autopilot" | "yolo"
-	sessionEnv []string
-	providers  []agent.ProviderConfig
-	activeIdx  int // -1 = no provider set (use env defaults)
+	workDir     string
+	model       string
+	mode        string // "default" | "autopilot" | "yolo"
+	githubToken string
+	copilotHome string
+	sessionEnv  []string
+	providers   []agent.ProviderConfig
+	activeIdx   int // -1 = no provider set (use env defaults)
 
 	mu sync.Mutex
 }
 
 // New creates a new Copilot LLM instance.
 func New(opts map[string]any) (agent.LLM, error) {
-	workDir, _ := opts["work_dir"].(string)
+	workDir := readStringOpt(opts, "work_dir", "")
 	if workDir == "" {
 		workDir = "."
 	}
-	model, _ := opts["model"].(string)
-	mode, _ := opts["mode"].(string)
-	mode = normalizeMode(mode)
+	model := readStringOpt(opts, "model", "")
+	mode := normalizeMode(readStringOpt(opts, "mode", "default"))
+	githubToken := readStringOpt(opts, "github_token", os.Getenv("COPILOT_GITHUB_TOKEN"))
+	copilotHome := readStringOpt(opts, "copilot_home", os.Getenv("COPILOT_HOME"))
 
 	if _, err := exec.LookPath("copilot"); err != nil {
 		return nil, fmt.Errorf("copilot: 'copilot' CLI not found in PATH, please install GitHub Copilot CLI first")
 	}
 
 	return &LLM{
-		workDir:   workDir,
-		model:     model,
-		mode:      mode,
-		activeIdx: -1,
+		workDir:     workDir,
+		model:       model,
+		mode:        mode,
+		githubToken: githubToken,
+		copilotHome: copilotHome,
+		activeIdx:   -1,
 	}, nil
 }
 
@@ -92,8 +102,15 @@ func (a *LLM) StartSession(ctx context.Context, sessionID string) (agent.AgentSe
 	a.mu.Lock()
 	model := a.model
 	mode := a.mode
+	workDir := a.workDir
 	extraEnv := make([]string, len(a.sessionEnv))
 	copy(extraEnv, a.sessionEnv)
+	if a.githubToken != "" {
+		extraEnv = append(extraEnv, "COPILOT_GITHUB_TOKEN="+a.githubToken)
+	}
+	if a.copilotHome != "" {
+		extraEnv = append(extraEnv, "COPILOT_HOME="+a.copilotHome)
+	}
 	extraEnv = append(extraEnv, a.providerEnvLocked()...)
 	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
 		if m := a.providers[a.activeIdx].Model; m != "" {
@@ -102,13 +119,49 @@ func (a *LLM) StartSession(ctx context.Context, sessionID string) (agent.AgentSe
 	}
 	a.mu.Unlock()
 
-	return newCopilotSession(ctx, a.workDir, model, mode, sessionID, extraEnv), nil
+	return newCopilotSession(ctx, workDir, model, mode, sessionID, extraEnv), nil
 }
 
 func (a *LLM) Stop() error { return nil }
 
-func (a *LLM) Reload(_ map[string]any) error {
-	slog.Info("copilot: reloaded config")
+func (a *LLM) Reload(opts map[string]any) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	workDir := readStringOpt(opts, "work_dir", a.workDir)
+	if workDir == "" {
+		workDir = "."
+	}
+	model := readStringOpt(opts, "model", a.model)
+	mode := normalizeMode(readStringOpt(opts, "mode", a.mode))
+	githubToken := readStringOpt(opts, "github_token", os.Getenv("COPILOT_GITHUB_TOKEN"))
+	copilotHome := readStringOpt(opts, "copilot_home", os.Getenv("COPILOT_HOME"))
+
+	changed := false
+	if workDir != a.workDir {
+		a.workDir = workDir
+		changed = true
+	}
+	if model != a.model {
+		a.model = model
+		changed = true
+	}
+	if mode != a.mode {
+		a.mode = mode
+		changed = true
+	}
+	if githubToken != a.githubToken {
+		a.githubToken = githubToken
+		changed = true
+	}
+	if copilotHome != a.copilotHome {
+		a.copilotHome = copilotHome
+		changed = true
+	}
+
+	if changed {
+		slog.Info("copilot: reloaded config", "work_dir", a.workDir, "model", a.model, "mode", a.mode, "home_configured", a.copilotHome != "", "token_configured", a.githubToken != "")
+	}
 	return nil
 }
 
@@ -179,6 +232,9 @@ func (a *LLM) SetSessionEnv(env []string) {
 func (a *LLM) SetWorkDir(dir string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if dir == "" {
+		dir = "."
+	}
 	a.workDir = dir
 	slog.Info("copilot: work dir changed", "dir", dir)
 }
@@ -277,4 +333,15 @@ func (a *LLM) providerEnvLocked() []string {
 		env = append(env, k+"="+v)
 	}
 	return env
+}
+
+func readStringOpt(opts map[string]any, key, fallback string) string {
+	if opts == nil {
+		return fallback
+	}
+	v, _ := opts[key].(string)
+	if v == "" {
+		return fallback
+	}
+	return v
 }

@@ -399,52 +399,83 @@ func (p *TelegramAccess) Stop() error {
 }
 
 func (p *TelegramAccess) Reload(opts map[string]any) error {
-	var token string
-	if opts != nil {
-		token, _ = opts["token"].(string)
-	}
-	if token == "" {
-		token = os.Getenv("TELEGRAM_TOKEN")
-	}
-	if token == "" {
-		p.mu.RLock()
-		token = p.token
-		p.mu.RUnlock()
-	}
-
 	p.mu.RLock()
 	oldToken := p.token
+	oldAllowFrom := p.allowFrom
+	oldGroupReplyAll := p.groupReplyAll
+	oldShareSession := p.shareSessionInChannel
 	p.mu.RUnlock()
 
+	// Resolve new token.
+	token := oldToken
+	if opts != nil {
+		if v, _ := opts["token"].(string); v != "" {
+			token = v
+		}
+	}
 	if token == oldToken {
+		if v := os.Getenv("TELEGRAM_TOKEN"); v != "" && v != token {
+			token = v
+		}
+	}
+
+	// Resolve other fields.
+	allowFrom := oldAllowFrom
+	if opts != nil {
+		if _, ok := opts["allow_from"]; ok {
+			allowFrom, _ = opts["allow_from"].(string)
+		}
+	}
+	groupReplyAll := oldGroupReplyAll
+	if opts != nil {
+		if v, ok := opts["group_reply_all"].(bool); ok {
+			groupReplyAll = v
+		}
+	}
+	shareSessionInChannel := oldShareSession
+	if opts != nil {
+		if v, ok := opts["share_session_in_channel"].(bool); ok {
+			shareSessionInChannel = v
+		}
+	}
+
+	changed := token != oldToken ||
+		allowFrom != oldAllowFrom ||
+		groupReplyAll != oldGroupReplyAll ||
+		shareSessionInChannel != oldShareSession
+
+	if !changed {
 		return nil
 	}
 
-	// Validate new token
-	newBot, err := tgbotapi.NewBotAPIWithClient(token, tgbotapi.APIEndpoint, p.httpClient)
-	if err != nil {
-		return fmt.Errorf("telegram reload: validation failed: %w", err)
+	var newBot *tgbotapi.BotAPI
+	if token != oldToken {
+		var err error
+		newBot, err = tgbotapi.NewBotAPIWithClient(token, tgbotapi.APIEndpoint, p.httpClient)
+		if err != nil {
+			return fmt.Errorf("telegram reload: validation failed: %w", err)
+		}
+		slog.Info("telegram: token verified, reloading...", "user", newBot.Self.UserName)
 	}
-
-	slog.Info("telegram: token verified, reloading...", "user", newBot.Self.UserName)
 
 	p.mu.Lock()
 	p.token = token
-	p.bot = newBot
+	p.allowFrom = allowFrom
+	p.groupReplyAll = groupReplyAll
+	p.shareSessionInChannel = shareSessionInChannel
+	if newBot != nil {
+		p.bot = newBot
+	}
 	p.mu.Unlock()
 
-	// For Telegram, we MUST restart the long polling loop because the updates chan is bound to the bot/token
+	// Restart the update loop so the goroutine picks up the new values cleanly.
 	if p.cancel != nil {
-		p.cancel() // This stops the current loop
+		p.cancel()
 	}
-
-	// Restart loop - we need to wait a bit or ensure the old one is gone.
-	// In a simple way, we just call Start again if we have a handler
 	if p.handler != nil {
 		go func() {
 			_ = p.Start(p.handler)
 		}()
 	}
-
 	return nil
 }

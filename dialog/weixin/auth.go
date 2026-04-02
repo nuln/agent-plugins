@@ -12,6 +12,7 @@ import (
 const (
 	DefaultIlinkBotType = "3"
 	QrLongPollTimeout   = 35 * time.Second
+	FixedBaseURL        = "https://ilinkai.weixin.qq.com"
 )
 
 type QRCodeResponse struct {
@@ -20,27 +21,30 @@ type QRCodeResponse struct {
 }
 
 type StatusResponse struct {
-	Status      string `json:"status"` // wait, scaned, confirmed, expired
-	BotToken    string `json:"bot_token"`
-	IlinkBotID  string `json:"ilink_bot_id"`
-	BaseURL     string `json:"baseurl"`
-	ILinkUserID string `json:"ilink_user_id"`
+	Status       string `json:"status"` // wait, scaned, confirmed, expired, scaned_but_redirect
+	BotToken     string `json:"bot_token"`
+	IlinkBotID   string `json:"ilink_bot_id"`
+	BaseURL      string `json:"baseurl"`
+	ILinkUserID  string `json:"ilink_user_id"`
+	RedirectHost string `json:"redirect_host"` // For scaned_but_redirect status
 }
 
 func (o *ApiOptions) FetchQRCode(ctx context.Context, botType string) (*QRCodeResponse, error) {
-	u := o.BaseURL
-	if u[len(u)-1] != '/' {
-		u += "/"
-	}
-	u += "ilink/bot/get_bot_qrcode?bot_type=" + url.QueryEscape(botType)
+	u := o.ensureTrailingSlash(FixedBaseURL)
+	endpoint := "ilink/bot/get_bot_qrcode?bot_type=" + url.QueryEscape(botType)
+	u += endpoint
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
-	// Add potential SKRouteTag if needed
+	// Add iLink compatibility headers
+	for k, v := range o.buildCommonHeaders() {
+		req.Header.Set(k, v)
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -58,17 +62,18 @@ func (o *ApiOptions) FetchQRCode(ctx context.Context, botType string) (*QRCodeRe
 }
 
 func (o *ApiOptions) PollQRStatus(ctx context.Context, qrcode string) (*StatusResponse, error) {
-	u := o.BaseURL
-	if u[len(u)-1] != '/' {
-		u += "/"
-	}
-	u += "ilink/bot/get_qrcode_status?qrcode=" + url.QueryEscape(qrcode)
+	u := o.ensureTrailingSlash(FixedBaseURL)
+	endpoint := "ilink/bot/get_qrcode_status?qrcode=" + url.QueryEscape(qrcode)
+	u += endpoint
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("iLink-App-ClientVersion", "1")
+	// Add iLink compatibility headers
+	for k, v := range o.buildCommonHeaders() {
+		req.Header.Set(k, v)
+	}
 
 	client := &http.Client{Timeout: QrLongPollTimeout + 2*time.Second}
 	resp, err := client.Do(req)

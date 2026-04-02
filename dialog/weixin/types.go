@@ -15,17 +15,17 @@ const (
 
 // GetUploadUrlReq represents a request for a CDN upload URL.
 type GetUploadUrlReq struct {
-	FileKey         string  `json:"filekey,omitempty"`
-	MediaType       int     `json:"media_type,omitempty"`
-	ToUserID        string  `json:"to_user_id,omitempty"`
-	RawSize         int64   `json:"rawsize,omitempty"`
-	RawFileMD5      string  `json:"rawfilemd5,omitempty"`
-	FileSize        int64   `json:"filesize,omitempty"`
-	ThumbRawSize    int64   `json:"thumb_rawsize,omitempty"`
-	ThumbRawFileMD5 string  `json:"thumb_rawfilemd5,omitempty"`
-	ThumbFileSize   int64   `json:"thumb_filesize,omitempty"`
-	NoNeedThumb     bool    `json:"no_need_thumb,omitempty"`
-	AESKey          string  `json:"aeskey,omitempty"`
+	FileKey         string    `json:"filekey,omitempty"`
+	MediaType       int       `json:"media_type,omitempty"`
+	ToUserID        string    `json:"to_user_id,omitempty"`
+	RawSize         int64     `json:"rawsize,omitempty"`
+	RawFileMD5      string    `json:"rawfilemd5,omitempty"`
+	FileSize        int64     `json:"filesize,omitempty"`
+	ThumbRawSize    int64     `json:"thumb_rawsize,omitempty"`
+	ThumbRawFileMD5 string    `json:"thumb_rawfilemd5,omitempty"`
+	ThumbFileSize   int64     `json:"thumb_filesize,omitempty"`
+	NoNeedThumb     bool      `json:"no_need_thumb,omitempty"`
+	AESKey          string    `json:"aeskey,omitempty"`
 	BaseInfo        *BaseInfo `json:"base_info,omitempty"`
 }
 
@@ -33,6 +33,7 @@ type GetUploadUrlReq struct {
 type GetUploadUrlResp struct {
 	UploadParam      string `json:"upload_param,omitempty"`
 	ThumbUploadParam string `json:"thumb_upload_param,omitempty"`
+	UploadFullURL    string `json:"upload_full_url,omitempty"` // Direct server-provided URL
 }
 
 // Message types
@@ -69,13 +70,14 @@ type CDNMedia struct {
 	EncryptQueryParam string `json:"encrypt_query_param,omitempty"`
 	AESKey            string `json:"aes_key,omitempty"` // Base64 encoded
 	EncryptType       int    `json:"encrypt_type,omitempty"`
+	FullURL           string `json:"full_url,omitempty"` // Direct server-provided download URL
 }
 
 // ImageItem represents an image message item.
 type ImageItem struct {
 	Media       *CDNMedia `json:"media,omitempty"`
 	ThumbMedia  *CDNMedia `json:"thumb_media,omitempty"`
-	AESKey      string    `json:"aeskey,omitempty"` // Hex string
+	AESKey      string    `json:"aeskey,omitempty"` // Hex string (preferred over media.aes_key)
 	URL         string    `json:"url,omitempty"`
 	MidSize     int64     `json:"mid_size,omitempty"`
 	ThumbSize   int64     `json:"thumb_size,omitempty"`
@@ -122,11 +124,11 @@ type RefMessage struct {
 
 // MessageItem represents a single piece of content in a message.
 type MessageItem struct {
-	Type         int        `json:"type,omitempty"`
-	CreateTimeMs int64      `json:"create_time_ms,omitempty"`
-	UpdateTimeMs int64      `json:"update_time_ms,omitempty"`
-	IsCompleted  bool       `json:"is_completed,omitempty"`
-	MsgID        string     `json:"msg_id,omitempty"`
+	Type         int         `json:"type,omitempty"`
+	CreateTimeMs int64       `json:"create_time_ms,omitempty"`
+	UpdateTimeMs int64       `json:"update_time_ms,omitempty"`
+	IsCompleted  bool        `json:"is_completed,omitempty"`
+	MsgID        string      `json:"msg_id,omitempty"`
 	RefMsg       *RefMessage `json:"ref_msg,omitempty"`
 	TextItem     *TextItem   `json:"text_item,omitempty"`
 	ImageItem    *ImageItem  `json:"image_item,omitempty"`
@@ -183,9 +185,9 @@ const (
 
 // SendTypingReq represents a request to send a typing indicator.
 type SendTypingReq struct {
-	ILinkUserID  string `json:"ilink_user_id,omitempty"`
-	TypingTicket string `json:"typing_ticket,omitempty"`
-	Status       int    `json:"status,omitempty"` // 1=typing, 2=cancel
+	ILinkUserID  string    `json:"ilink_user_id,omitempty"`
+	TypingTicket string    `json:"typing_ticket,omitempty"`
+	Status       int       `json:"status,omitempty"` // 1=typing, 2=cancel
 	BaseInfo     *BaseInfo `json:"base_info,omitempty"`
 }
 

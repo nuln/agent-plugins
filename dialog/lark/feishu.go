@@ -1456,25 +1456,94 @@ func (p *LarkAccess) Stop() error {
 }
 
 func (p *LarkAccess) Reload(opts map[string]any) error {
-	var appID string
-	var appSecret string
-	if opts != nil {
-		appID, _ = opts["app_id"].(string)
-		appSecret, _ = opts["app_secret"].(string)
+	if opts == nil {
+		return nil
 	}
+
+	// Resolve new credential values, fall back to current.
+	appID, _ := opts["app_id"].(string)
 	if appID == "" {
 		appID = os.Getenv("LARK_APP_ID")
 	}
+	if appID == "" {
+		appID = p.appID
+	}
+	appSecret, _ := opts["app_secret"].(string)
 	if appSecret == "" {
 		appSecret = os.Getenv("LARK_APP_SECRET")
 	}
+	if appSecret == "" {
+		appSecret = p.appSecret
+	}
 
-	if (appID != "" && appID != p.appID) || (appSecret != "" && appSecret != p.appSecret) {
-		// In production, you might want to restart the WS client or validate the new credentials
-		slog.Warn(p.tag()+": reloading app_id or app_secret (requires restart/revalidation)", "app_id", appID)
-		p.appID = appID
-		p.appSecret = appSecret
-		p.client = lark.NewClient(appID, appSecret, lark.WithOpenBaseUrl(p.domain))
+	// For string fields with meaningful empty-string: check key presence.
+	allowFrom := p.allowFrom
+	if v, ok := opts["allow_from"].(string); ok {
+		allowFrom = v
+	}
+	reactionEmoji := p.reactionEmoji
+	if v, ok := opts["reaction_emoji"].(string); ok {
+		if v == "none" {
+			v = ""
+		}
+		reactionEmoji = v
+	}
+	groupReplyAll := p.groupReplyAll
+	if v, ok := opts["group_reply_all"].(bool); ok {
+		groupReplyAll = v
+	}
+	shareSessionInChannel := p.shareSessionInChannel
+	if v, ok := opts["share_session_in_channel"].(bool); ok {
+		shareSessionInChannel = v
+	}
+	replyInThread := p.replyInThread
+	if v, ok := opts["reply_in_thread"].(bool); ok {
+		replyInThread = v
+	}
+
+	credentialsChanged := appID != p.appID || appSecret != p.appSecret
+	configChanged := allowFrom != p.allowFrom ||
+		reactionEmoji != p.reactionEmoji ||
+		groupReplyAll != p.groupReplyAll ||
+		shareSessionInChannel != p.shareSessionInChannel ||
+		replyInThread != p.replyInThread
+
+	if !credentialsChanged && !configChanged {
+		return nil
+	}
+
+	// Apply all field changes.
+	p.appID = appID
+	p.appSecret = appSecret
+	p.allowFrom = allowFrom
+	p.reactionEmoji = reactionEmoji
+	p.groupReplyAll = groupReplyAll
+	p.shareSessionInChannel = shareSessionInChannel
+	p.replyInThread = replyInThread
+
+	// Rebuild REST client with (potentially new) credentials.
+	var clientOpts []lark.ClientOptionFunc
+	if p.domain != lark.FeishuBaseUrl {
+		clientOpts = append(clientOpts, lark.WithOpenBaseUrl(p.domain))
+	}
+	p.client = lark.NewClient(appID, appSecret, clientOpts...)
+
+	slog.Info(p.tag()+": config reloaded",
+		"credentials_changed", credentialsChanged,
+		"config_changed", configChanged)
+
+	// Restart WS connection to pick up all changes.
+	if p.handler != nil {
+		handler := p.handler
+		if p.cancel != nil {
+			p.cancel()
+		}
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			if err := p.Start(handler); err != nil {
+				slog.Error(p.tag()+": failed to restart WS after reload", "error", err)
+			}
+		}()
 	}
 	return nil
 }
